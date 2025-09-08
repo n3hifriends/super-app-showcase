@@ -1,1 +1,113 @@
+totally — here’s a step-by-step for the VS Code Project Explorer + Code Outline (Outline view) to make your React Native codebase easier to “see” at a glance. (These don’t draw diagrams; they organize and navigate your files/symbols so you get a block-like overview fast.)
+
+1) Open your project correctly
+	1.	Open VS Code → File › Open Folder… → pick your RN repo root (the folder that has package.json).
+	2.	If you use a subfolder like apps/mobile, open that as the workspace root for less clutter.
+
+2) Clean up the Project Explorer (hide noise)
+	1.	Press Ctrl+, (Cmd+, on Mac) to open Settings.
+	2.	Click the {} icon (top right) to edit settings.json and add:
+
+{
+  "files.exclude": {
+    "**/node_modules": true,
+    "**/.git": true,
+    "**/.gradle": true,
+    "**/.idea": true,
+    "android": true,
+    "ios": true,
+    "coverage": true,
+    "dist": true,
+    "build": true
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "android": true,
+    "ios": true,
+    "build": true,
+    "dist": true
+  },
+  "explorer.compactFolders": false
+}
+
+	•	This keeps Explorer focused on src/ (or wherever your JS/TS lives).
+	•	Toggle any of those back to false if you need to see them.
+
+3) Turn on the Outline view
+	1.	View › Appearance › Show Side Bar (if hidden).
+	2.	View › Open View… → type Outline → hit Enter.
+(Drag the Outline panel under Explorer if you want it docked there.)
+
+4) Make the Outline show what you care about
+
+Add these to settings.json to control symbol types:
+
+{
+  "outline.showFields": false,
+  "outline.showVariables": true,
+  "outline.showFunctions": true,
+  "outline.showClasses": true,
+  "outline.showModules": true,
+  "outline.sortOrder": "position"   // or "name", if you prefer alphabetical
+}
+
+Tips:
+	•	React components (PascalCase function names) appear as functions in Outline.
+	•	You can create collapsible regions that also appear in the Outline:
+
+// #region UI
+export function Header() { /* ... */ }
+// #endregion
+
+5) Navigate lightning-fast
+	•	Within file (symbols list): Ctrl+Shift+O (Cmd+Shift+O) → jump to any function/component.
+	•	Across workspace (all symbols): Ctrl+T (Cmd+T) → search any symbol name project-wide.
+	•	Breadcrumbs: View › Appearance › Breadcrumbs → shows file path + current symbol; click to jump.
+
+6) Get “module blocks” by folder structure
+
+Organize src/ by feature to get a block-like view in Explorer:
+
+src/
+  auth/
+    screens/
+    hooks/
+    api/
+  home/
+    screens/
+    components/
+  settings/
+
+This makes Explorer itself a high-level “block” map of your app. Keep files small and named after screens (HomeScreen.tsx, ProfileScreen.tsx) so Outline reads cleanly.
+
+7) Make JS/TS navigation rock-solid (aliases)
+
+If you use path aliases like @/components, help VS Code resolve them:
+
+tsconfig.json / jsconfig.json
+
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    }
+  },
+  "include": ["src"]
+}
+
+Reload the window (Ctrl+Shift+P → Developer: Reload Window) so “Go to Definition” and Outline stay accurate.
+
+8) Optional helpful extensions
+	•	ESLint (keeps symbols consistent)
+	•	React Native Tools (debugging; doesn’t change Outline, but handy)
+	•	Bookmarks (mark important files/folders for quick access)
+
+9) What this gives you (and what it doesn’t)
+	•	✅ Quick structural overview (folders/modules) via Explorer
+	•	✅ Per-file component/function map via Outline
+	•	❌ Not a graph diagram of navigation. For actual flow diagrams, use the Mermaid/PlantUML approach we set up earlier (I can adapt that script for your repo when you’re ready).
+
+If you tell me your src layout (or paste a screenshot), I’ll suggest a tailored files.exclude + folder scheme so your Explorer truly looks like a high-level block diagram of your app.
+
 
