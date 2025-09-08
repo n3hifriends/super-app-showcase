@@ -1,113 +1,250 @@
-totally — here’s a step-by-step for the VS Code Project Explorer + Code Outline (Outline view) to make your React Native codebase easier to “see” at a glance. (These don’t draw diagrams; they organize and navigate your files/symbols so you get a block-like overview fast.)
+#!/usr/bin/env node
+import fs from 'fs';
+import path from 'path';
+import glob from 'glob';
+import { parse } from '@babel/parser';
+import traverse from '@babel/traverse';
 
-1) Open your project correctly
-	1.	Open VS Code → File › Open Folder… → pick your RN repo root (the folder that has package.json).
-	2.	If you use a subfolder like apps/mobile, open that as the workspace root for less clutter.
+const SRC_GLOB = process.argv[2] || 'src/**/*.{js,jsx,ts,tsx}';
 
-2) Clean up the Project Explorer (hide noise)
-	1.	Press Ctrl+, (Cmd+, on Mac) to open Settings.
-	2.	Click the {} icon (top right) to edit settings.json and add:
+// --- Utilities ---
+const readFile = (p) => fs.readFileSync(p, 'utf8');
 
-{
-  "files.exclude": {
-    "**/node_modules": true,
-    "**/.git": true,
-    "**/.gradle": true,
-    "**/.idea": true,
-    "android": true,
-    "ios": true,
-    "coverage": true,
-    "dist": true,
-    "build": true
-  },
-  "search.exclude": {
-    "**/node_modules": true,
-    "android": true,
-    "ios": true,
-    "build": true,
-    "dist": true
-  },
-  "explorer.compactFolders": false
+function parseCode(code, filename) {
+  return parse(code, {
+    sourceType: 'module',
+    sourceFilename: filename,
+    plugins: [
+      'jsx',
+      'typescript',
+      // Allow modern syntax just in case:
+      'classProperties',
+      'decorators-legacy',
+      'objectRestSpread',
+      'dynamicImport',
+      'optionalChaining',
+      'nullishCoalescingOperator',
+      'topLevelAwait',
+    ],
+  });
 }
 
-	•	This keeps Explorer focused on src/ (or wherever your JS/TS lives).
-	•	Toggle any of those back to false if you need to see them.
+// Recognize e.g. const Stack = createNativeStackNavigator();
+const navigatorFactoryNames = new Set([
+  'createNativeStackNavigator',
+  'createStackNavigator',
+  'createBottomTabNavigator',
+  'createMaterialTopTabNavigator',
+  'createDrawerNavigator',
+]);
 
-3) Turn on the Outline view
-	1.	View › Appearance › Show Side Bar (if hidden).
-	2.	View › Open View… → type Outline → hit Enter.
-(Drag the Outline panel under Explorer if you want it docked there.)
-
-4) Make the Outline show what you care about
-
-Add these to settings.json to control symbol types:
-
-{
-  "outline.showFields": false,
-  "outline.showVariables": true,
-  "outline.showFunctions": true,
-  "outline.showClasses": true,
-  "outline.showModules": true,
-  "outline.sortOrder": "position"   // or "name", if you prefer alphabetical
+// JSX tags like: <Stack.Navigator>, <Tab.Navigator>, <Drawer.Navigator>, <Stack.Screen>
+function getJSXName(node) {
+  if (!node) return null;
+  if (node.type === 'JSXIdentifier') return node.name;
+  if (node.type === 'JSXMemberExpression') {
+    const left = getJSXName(node.object);
+    const right = getJSXName(node.property);
+    return left && right ? `${left}.${right}` : null;
+  }
+  return null;
 }
 
-Tips:
-	•	React components (PascalCase function names) appear as functions in Outline.
-	•	You can create collapsible regions that also appear in the Outline:
-
-// #region UI
-export function Header() { /* ... */ }
-// #endregion
-
-5) Navigate lightning-fast
-	•	Within file (symbols list): Ctrl+Shift+O (Cmd+Shift+O) → jump to any function/component.
-	•	Across workspace (all symbols): Ctrl+T (Cmd+T) → search any symbol name project-wide.
-	•	Breadcrumbs: View › Appearance › Breadcrumbs → shows file path + current symbol; click to jump.
-
-6) Get “module blocks” by folder structure
-
-Organize src/ by feature to get a block-like view in Explorer:
-
-src/
-  auth/
-    screens/
-    hooks/
-    api/
-  home/
-    screens/
-    components/
-  settings/
-
-This makes Explorer itself a high-level “block” map of your app. Keep files small and named after screens (HomeScreen.tsx, ProfileScreen.tsx) so Outline reads cleanly.
-
-7) Make JS/TS navigation rock-solid (aliases)
-
-If you use path aliases like @/components, help VS Code resolve them:
-
-tsconfig.json / jsconfig.json
-
-{
-  "compilerOptions": {
-    "baseUrl": ".",
-    "paths": {
-      "@/*": ["src/*"]
+function attrValueString(attr) {
+  if (!attr || !attr.value) return null;
+  if (attr.value.type === 'StringLiteral') return attr.value.value;
+  if (attr.value.type === 'JSXExpressionContainer') {
+    const expr = attr.value.expression;
+    if (expr.type === 'StringLiteral') return expr.value;
+    if (expr.type === 'Identifier') return expr.name; // component identifier fallback
+    if (expr.type === 'MemberExpression') {
+      // e.g., SomeNavigator
+      if (expr.property && expr.property.name) return expr.property.name;
     }
-  },
-  "include": ["src"]
+  }
+  return null;
 }
 
-Reload the window (Ctrl+Shift+P → Developer: Reload Window) so “Go to Definition” and Outline stay accurate.
+function firstAttr(node, names) {
+  for (const a of node.openingElement.attributes || []) {
+    if (a.type === 'JSXAttribute' && names.includes(a.name.name)) return a;
+  }
+  return null;
+}
 
-8) Optional helpful extensions
-	•	ESLint (keeps symbols consistent)
-	•	React Native Tools (debugging; doesn’t change Outline, but handy)
-	•	Bookmarks (mark important files/folders for quick access)
+const project = {
+  navigators: new Map(), // navVarName -> { type: 'Stack'|'Tab'|'Drawer', screens: Set<screenName>, file }
+  screensInNavigators: {}, // navigator -> Set of screen names
+  edges: new Set(), // "A-->B"
+};
 
-9) What this gives you (and what it doesn’t)
-	•	✅ Quick structural overview (folders/modules) via Explorer
-	•	✅ Per-file component/function map via Outline
-	•	❌ Not a graph diagram of navigation. For actual flow diagrams, use the Mermaid/PlantUML approach we set up earlier (I can adapt that script for your repo when you’re ready).
+function upsertNavigator(nvName, type, file) {
+  if (!project.navigators.has(nvName)) {
+    project.navigators.set(nvName, { type, screens: new Set(), file });
+  } else {
+    const obj = project.navigators.get(nvName);
+    if (!obj.type && type) obj.type = type;
+    if (!obj.file) obj.file = file;
+  }
+}
 
-If you tell me your src layout (or paste a screenshot), I’ll suggest a tailored files.exclude + folder scheme so your Explorer truly looks like a high-level block diagram of your app.
+function addEdge(from, to) {
+  if (!from || !to || from === to) return;
+  project.edges.add(`${from}-->${to}`);
+}
 
+function addScreenToNav(nav, screen) {
+  if (!nav || !screen) return;
+  upsertNavigator(nav);
+  project.navigators.get(nav).screens.add(screen);
+}
 
+// --- Scan files ---
+const files = glob.sync(SRC_GLOB, { ignore: ['**/node_modules/**', '**/android/**', '**/ios/**'] });
+
+for (const file of files) {
+  let code;
+  try { code = readFile(file); } catch { continue; }
+  let ast;
+  try { ast = parseCode(code, file); } catch { continue; }
+
+  // Track local identifiers bound to a navigator factory result
+  // e.g., const Stack = createNativeStackNavigator();
+  const localNavigatorVars = new Set();
+
+  traverse(ast, {
+    VariableDeclarator(p) {
+      const id = p.node.id;
+      const init = p.node.init;
+      if (!id || id.type !== 'Identifier' || !init) return;
+      if (
+        init.type === 'CallExpression' &&
+        ((init.callee.type === 'Identifier' && navigatorFactoryNames.has(init.callee.name)) ||
+         (init.callee.type === 'MemberExpression' && init.callee.property && navigatorFactoryNames.has(init.callee.property.name)))
+      ) {
+        localNavigatorVars.add(id.name);
+        // infer type from callee:
+        let t = 'Navigator';
+        const callee = init.callee;
+        const name = callee.type === 'Identifier'
+          ? callee.name
+          : (callee.property?.name || 'createNavigator');
+        if (name.includes('Stack')) t = 'Stack';
+        else if (name.includes('Tab')) t = 'Tab';
+        else if (name.includes('Drawer')) t = 'Drawer';
+        upsertNavigator(id.name, t, file);
+      }
+    },
+
+    // Find <Stack.Navigator> trees and <Stack.Screen name="X" />
+    JSXElement(p) {
+      const opening = p.node.openingElement;
+      const tagName = getJSXName(opening.name); // e.g., "Stack.Navigator" or "Stack.Screen"
+      if (!tagName) return;
+
+      // Only care about X.Navigator
+      if (tagName.endsWith('.Navigator')) {
+        const navVar = tagName.split('.')[0]; // "Stack"
+        if (localNavigatorVars.has(navVar)) {
+          upsertNavigator(navVar, project.navigators.get(navVar)?.type, file);
+
+          // collect all immediate child Screens
+          const children = p.node.children || [];
+          for (const ch of children) {
+            if (ch.type !== 'JSXElement') continue;
+            const childName = getJSXName(ch.openingElement.name);
+            if (!childName || !childName.endsWith('.Screen')) continue;
+
+            const nameAttr = firstAttr(ch, ['name']);
+            const screenName = nameAttr ? attrValueString(nameAttr) : null;
+            if (screenName) addScreenToNav(navVar, screenName);
+
+            // Also check for component prop that might itself be a Navigator component
+            const compAttr = firstAttr(ch, ['component']);
+            const compVal = compAttr ? attrValueString(compAttr) : null;
+            // If component looks like a navigator component identifier, keep track as a "nested" screen label
+            if (compVal && /^[A-Z].*Navigator$/.test(compVal)) {
+              addScreenToNav(navVar, `${screenName || compVal} (nested)`);
+            }
+          }
+        }
+      }
+    },
+
+    // Find navigation.navigate('ScreenName') calls
+    CallExpression(p) {
+      const callee = p.node.callee;
+      if (
+        callee &&
+        callee.type === 'MemberExpression' &&
+        callee.property &&
+        callee.property.type === 'Identifier' &&
+        callee.property.name === 'navigate'
+      ) {
+        const args = p.node.arguments || [];
+        if (args.length > 0 && args[0].type === 'StringLiteral') {
+          const target = args[0].value;
+          // We don't always know "from", so we will add generic edge ScreenX-->ScreenY later
+          // but here we at least register target in a pool
+          addEdge('SomeScreen', target); // placeholder; we’ll refine below if possible
+        }
+      }
+    },
+  });
+
+  // OPTIONAL refinement (best-effort): infer "from" screen by nearest function/Component name
+  traverse(ast, {
+    CallExpression(p) {
+      const callee = p.node.callee;
+      if (
+        callee?.type === 'MemberExpression' &&
+        callee.property?.type === 'Identifier' &&
+        callee.property.name === 'navigate'
+      ) {
+        const args = p.node.arguments || [];
+        if (!(args[0] && args[0].type === 'StringLiteral')) return;
+        const target = args[0].value;
+
+        // Walk up to find the nearest function or variable name (component-ish)
+        let fromName = null;
+        let curr = p.parentPath;
+        while (curr && !fromName) {
+          const n = curr.node;
+          if (n.type === 'FunctionDeclaration' && n.id?.name) fromName = n.id.name;
+          if (n.type === 'VariableDeclarator' && n.id?.type === 'Identifier') fromName = n.id.name;
+          if (n.type === 'ClassDeclaration' && n.id?.name) fromName = n.id.name;
+          curr = curr.parentPath;
+        }
+        if (fromName) addEdge(fromName, target);
+      }
+    }
+  });
+}
+
+// --- Build Mermaid ---
+const lines = [];
+lines.push('```mermaid');
+lines.push('flowchart TD');
+lines.push('  %% Auto-generated React Navigation graph');
+
+for (const [nav, meta] of project.navigators.entries()) {
+  const label = `${meta.type || 'Navigator'}:${nav}`;
+  const groupId = `subgraph_${nav}`;
+  lines.push(`  subgraph ${groupId}["${label}"]`);
+  for (const s of meta.screens) {
+    const nodeId = `${nav}_${s}`.replace(/[^a-zA-Z0-9_]/g, '_');
+    lines.push(`    ${nodeId}["${s}"]`);
+  }
+  lines.push('  end');
+}
+
+// Edges inferred from navigate() calls (best-effort)
+for (const e of project.edges) {
+  const [from, to] = e.split('-->');
+  const fromId = from.replace(/[^a-zA-Z0-9_]/g, '_');
+  const toId = to.replace(/[^a-zA-Z0-9_]/g, '_');
+  lines.push(`  ${fromId} --> ${toId}`);
+}
+
+lines.push('```');
+console.log(lines.join('\n'));
