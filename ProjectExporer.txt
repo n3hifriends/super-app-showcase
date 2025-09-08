@@ -1,35 +1,63 @@
 #!/usr/bin/env node
+/**
+ * React Navigation → Mermaid generator (split-safe)
+ * - Works with ESM + glob@10
+ * - Raises Mermaid edge limit via init block
+ * - Dedupes edges
+ * - Splits into multiple .mmd files if edges exceed a threshold
+ */
 import fs from 'fs';
 import path from 'path';
-import glob from 'glob';
+import { fileURLToPath } from 'url';
+import { glob } from 'glob';
 import { parse } from '@babel/parser';
-import traverse from '@babel/traverse';
+import traverseModule from '@babel/traverse';
+const traverse = traverseModule.default;
 
+// ---------- CLI args ----------
 const SRC_GLOB = process.argv[2] || 'src/**/*.{js,jsx,ts,tsx}';
+const OUT_DIR = process.argv[3] || 'docs';
+const BASENAME = process.argv[4] || 'nav_graph';
+const EDGE_LIMIT_PER_FILE = Number(process.argv[5] || 900); // edges per output file
+const MAX_EDGES_INIT = Number(process.argv[6] || 4000);     // Mermaid init maxEdges
 
-// --- Utilities ---
-const readFile = (p) => fs.readFileSync(p, 'utf8');
+// ---------- Utils ----------
+const ensureDir = (p) => fs.mkdirSync(p, { recursive: true });
+const writeText = (p, s) => fs.writeFileSync(p, s, 'utf8');
 
-function parseCode(code, filename) {
-  return parse(code, {
-    sourceType: 'module',
-    sourceFilename: filename,
-    plugins: [
-      'jsx',
-      'typescript',
-      // Allow modern syntax just in case:
-      'classProperties',
-      'decorators-legacy',
-      'objectRestSpread',
-      'dynamicImport',
-      'optionalChaining',
-      'nullishCoalescingOperator',
-      'topLevelAwait',
-    ],
-  });
+function attrValueString(attr) {
+  if (!attr || !attr.value) return null;
+  if (attr.value.type === 'StringLiteral') return attr.value.value;
+  if (attr.value.type === 'JSXExpressionContainer') {
+    const expr = attr.value.expression;
+    if (!expr) return null;
+    if (expr.type === 'StringLiteral') return expr.value;
+    if (expr.type === 'Identifier') return expr.name;
+    if (expr.type === 'MemberExpression' && expr.property?.name) return expr.property.name;
+  }
+  return null;
+}
+function getJSXName(node) {
+  if (!node) return null;
+  if (node.type === 'JSXIdentifier') return node.name;
+  if (node.type === 'JSXMemberExpression') {
+    const l = getJSXName(node.object);
+    const r = getJSXName(node.property);
+    return l && r ? `${l}.${r}` : null;
+  }
+  return null;
+}
+function firstAttr(node, names) {
+  for (const a of node.openingElement.attributes || []) {
+    if (a.type === 'JSXAttribute' && names.includes(a.name.name)) return a;
+  }
+  return null;
+}
+function sanitizeId(s) {
+  return String(s).replace(/[^a-zA-Z0-9_]/g, '_');
 }
 
-// Recognize e.g. const Stack = createNativeStackNavigator();
+// ---------- Data model ----------
 const navigatorFactoryNames = new Set([
   'createNativeStackNavigator',
   'createStackNavigator',
@@ -38,78 +66,56 @@ const navigatorFactoryNames = new Set([
   'createDrawerNavigator',
 ]);
 
-// JSX tags like: <Stack.Navigator>, <Tab.Navigator>, <Drawer.Navigator>, <Stack.Screen>
-function getJSXName(node) {
-  if (!node) return null;
-  if (node.type === 'JSXIdentifier') return node.name;
-  if (node.type === 'JSXMemberExpression') {
-    const left = getJSXName(node.object);
-    const right = getJSXName(node.property);
-    return left && right ? `${left}.${right}` : null;
-  }
-  return null;
-}
-
-function attrValueString(attr) {
-  if (!attr || !attr.value) return null;
-  if (attr.value.type === 'StringLiteral') return attr.value.value;
-  if (attr.value.type === 'JSXExpressionContainer') {
-    const expr = attr.value.expression;
-    if (expr.type === 'StringLiteral') return expr.value;
-    if (expr.type === 'Identifier') return expr.name; // component identifier fallback
-    if (expr.type === 'MemberExpression') {
-      // e.g., SomeNavigator
-      if (expr.property && expr.property.name) return expr.property.name;
-    }
-  }
-  return null;
-}
-
-function firstAttr(node, names) {
-  for (const a of node.openingElement.attributes || []) {
-    if (a.type === 'JSXAttribute' && names.includes(a.name.name)) return a;
-  }
-  return null;
-}
-
 const project = {
-  navigators: new Map(), // navVarName -> { type: 'Stack'|'Tab'|'Drawer', screens: Set<screenName>, file }
-  screensInNavigators: {}, // navigator -> Set of screen names
-  edges: new Set(), // "A-->B"
+  navigators: new Map(), // navVar -> { type, screens:Set<string>, file }
+  edges: new Set(),      // "From-->To"
 };
 
-function upsertNavigator(nvName, type, file) {
-  if (!project.navigators.has(nvName)) {
-    project.navigators.set(nvName, { type, screens: new Set(), file });
+function upsertNavigator(name, type, file) {
+  if (!project.navigators.has(name)) {
+    project.navigators.set(name, { type, screens: new Set(), file });
   } else {
-    const obj = project.navigators.get(nvName);
+    const obj = project.navigators.get(name);
     if (!obj.type && type) obj.type = type;
     if (!obj.file) obj.file = file;
   }
 }
-
+function addScreen(nav, screen) {
+  if (!nav || !screen) return;
+  upsertNavigator(nav);
+  project.navigators.get(nav).screens.add(screen);
+}
 function addEdge(from, to) {
   if (!from || !to || from === to) return;
   project.edges.add(`${from}-->${to}`);
 }
 
-function addScreenToNav(nav, screen) {
-  if (!nav || !screen) return;
-  upsertNavigator(nav);
-  project.navigators.get(nav).screens.add(screen);
-}
-
-// --- Scan files ---
-const files = glob.sync(SRC_GLOB, { ignore: ['**/node_modules/**', '**/android/**', '**/ios/**'] });
+// ---------- Parse & collect ----------
+const files = await glob(SRC_GLOB, {
+  ignore: ['**/node_modules/**', '**/android/**', '**/ios/**'],
+});
 
 for (const file of files) {
   let code;
-  try { code = readFile(file); } catch { continue; }
-  let ast;
-  try { ast = parseCode(code, file); } catch { continue; }
+  try { code = fs.readFileSync(file, 'utf8'); } catch { continue; }
 
-  // Track local identifiers bound to a navigator factory result
-  // e.g., const Stack = createNativeStackNavigator();
+  let ast;
+  try {
+    ast = parse(code, {
+      sourceType: 'module',
+      sourceFilename: file,
+      plugins: [
+        'jsx','typescript',
+        'classProperties','decorators-legacy',
+        'objectRestSpread','dynamicImport',
+        'optionalChaining','nullishCoalescingOperator',
+        'topLevelAwait',
+      ],
+    });
+  } catch {
+    continue;
+  }
+
   const localNavigatorVars = new Set();
 
   traverse(ast, {
@@ -117,13 +123,16 @@ for (const file of files) {
       const id = p.node.id;
       const init = p.node.init;
       if (!id || id.type !== 'Identifier' || !init) return;
-      if (
+
+      const isNavFactory =
         init.type === 'CallExpression' &&
-        ((init.callee.type === 'Identifier' && navigatorFactoryNames.has(init.callee.name)) ||
-         (init.callee.type === 'MemberExpression' && init.callee.property && navigatorFactoryNames.has(init.callee.property.name)))
-      ) {
+        (
+          (init.callee.type === 'Identifier' && navigatorFactoryNames.has(init.callee.name)) ||
+          (init.callee.type === 'MemberExpression' && init.callee.property && navigatorFactoryNames.has(init.callee.property.name))
+        );
+
+      if (isNavFactory) {
         localNavigatorVars.add(id.name);
-        // infer type from callee:
         let t = 'Navigator';
         const callee = init.callee;
         const name = callee.type === 'Identifier'
@@ -136,63 +145,38 @@ for (const file of files) {
       }
     },
 
-    // Find <Stack.Navigator> trees and <Stack.Screen name="X" />
     JSXElement(p) {
       const opening = p.node.openingElement;
-      const tagName = getJSXName(opening.name); // e.g., "Stack.Navigator" or "Stack.Screen"
+      const tagName = getJSXName(opening.name);
       if (!tagName) return;
 
-      // Only care about X.Navigator
       if (tagName.endsWith('.Navigator')) {
-        const navVar = tagName.split('.')[0]; // "Stack"
-        if (localNavigatorVars.has(navVar)) {
-          upsertNavigator(navVar, project.navigators.get(navVar)?.type, file);
+        const navVar = tagName.split('.')[0];
+        if (!localNavigatorVars.has(navVar)) return;
 
-          // collect all immediate child Screens
-          const children = p.node.children || [];
-          for (const ch of children) {
-            if (ch.type !== 'JSXElement') continue;
-            const childName = getJSXName(ch.openingElement.name);
-            if (!childName || !childName.endsWith('.Screen')) continue;
+        upsertNavigator(navVar, project.navigators.get(navVar)?.type, file);
 
-            const nameAttr = firstAttr(ch, ['name']);
-            const screenName = nameAttr ? attrValueString(nameAttr) : null;
-            if (screenName) addScreenToNav(navVar, screenName);
+        const children = p.node.children || [];
+        for (const ch of children) {
+          if (ch.type !== 'JSXElement') continue;
+          const childName = getJSXName(ch.openingElement.name);
+          if (!childName || !childName.endsWith('.Screen')) continue;
 
-            // Also check for component prop that might itself be a Navigator component
-            const compAttr = firstAttr(ch, ['component']);
-            const compVal = compAttr ? attrValueString(compAttr) : null;
-            // If component looks like a navigator component identifier, keep track as a "nested" screen label
-            if (compVal && /^[A-Z].*Navigator$/.test(compVal)) {
-              addScreenToNav(navVar, `${screenName || compVal} (nested)`);
-            }
+          const nameAttr = firstAttr(ch, ['name']);
+          const screenName = nameAttr ? attrValueString(nameAttr) : null;
+          if (screenName) addScreen(navVar, screenName);
+
+          const compAttr = firstAttr(ch, ['component']);
+          const compVal = compAttr ? attrValueString(compAttr) : null;
+          if (compVal && /^[A-Z].*Navigator$/.test(compVal)) {
+            addScreen(navVar, `${screenName || compVal} (nested)`);
           }
-        }
-      }
-    },
-
-    // Find navigation.navigate('ScreenName') calls
-    CallExpression(p) {
-      const callee = p.node.callee;
-      if (
-        callee &&
-        callee.type === 'MemberExpression' &&
-        callee.property &&
-        callee.property.type === 'Identifier' &&
-        callee.property.name === 'navigate'
-      ) {
-        const args = p.node.arguments || [];
-        if (args.length > 0 && args[0].type === 'StringLiteral') {
-          const target = args[0].value;
-          // We don't always know "from", so we will add generic edge ScreenX-->ScreenY later
-          // but here we at least register target in a pool
-          addEdge('SomeScreen', target); // placeholder; we’ll refine below if possible
         }
       }
     },
   });
 
-  // OPTIONAL refinement (best-effort): infer "from" screen by nearest function/Component name
+  // Second pass: try to infer "from" for navigate() calls
   traverse(ast, {
     CallExpression(p) {
       const callee = p.node.callee;
@@ -205,7 +189,6 @@ for (const file of files) {
         if (!(args[0] && args[0].type === 'StringLiteral')) return;
         const target = args[0].value;
 
-        // Walk up to find the nearest function or variable name (component-ish)
         let fromName = null;
         let curr = p.parentPath;
         while (curr && !fromName) {
@@ -215,36 +198,63 @@ for (const file of files) {
           if (n.type === 'ClassDeclaration' && n.id?.name) fromName = n.id.name;
           curr = curr.parentPath;
         }
-        if (fromName) addEdge(fromName, target);
+        addEdge(fromName || 'SomeScreen', target); // fallback if we cannot infer
       }
     }
   });
 }
 
-// --- Build Mermaid ---
-const lines = [];
-lines.push('```mermaid');
-lines.push('flowchart TD');
-lines.push('  %% Auto-generated React Navigation graph');
+// ---------- Emit Mermaid (with splitting) ----------
+ensureDir(OUT_DIR);
 
-for (const [nav, meta] of project.navigators.entries()) {
-  const label = `${meta.type || 'Navigator'}:${nav}`;
-  const groupId = `subgraph_${nav}`;
-  lines.push(`  subgraph ${groupId}["${label}"]`);
-  for (const s of meta.screens) {
-    const nodeId = `${nav}_${s}`.replace(/[^a-zA-Z0-9_]/g, '_');
-    lines.push(`    ${nodeId}["${s}"]`);
+// common header with high edge cap
+function header() {
+  return [
+    `%%{init: {"maxEdges": ${MAX_EDGES_INIT}}}%%`,
+    'flowchart TD',
+    '  %% Auto-generated React Navigation graph',
+  ].join('\n');
+}
+
+// nodes (subgraphs) appear in every file so each chunk is self-contained
+function emitNodes() {
+  const lines = [];
+  for (const [nav, meta] of project.navigators.entries()) {
+    const label = `${meta.type || 'Navigator'}:${nav}`;
+    const groupId = `subgraph_${sanitizeId(nav)}`;
+    lines.push(`  subgraph ${groupId}["${label}"]`);
+    for (const s of meta.screens) {
+      const nodeId = sanitizeId(`${nav}_${s}`);
+      lines.push(`    ${nodeId}["${s}"]`);
+    }
+    lines.push('  end');
   }
-  lines.push('  end');
+  return lines.join('\n');
 }
 
-// Edges inferred from navigate() calls (best-effort)
-for (const e of project.edges) {
-  const [from, to] = e.split('-->');
-  const fromId = from.replace(/[^a-zA-Z0-9_]/g, '_');
-  const toId = to.replace(/[^a-zA-Z0-9_]/g, '_');
-  lines.push(`  ${fromId} --> ${toId}`);
+// split edges into chunks
+const allEdges = Array.from(project.edges);
+const chunks = [];
+for (let i = 0; i < allEdges.length; i += EDGE_LIMIT_PER_FILE) {
+  chunks.push(allEdges.slice(i, i + EDGE_LIMIT_PER_FILE));
 }
 
-lines.push('```');
-console.log(lines.join('\n'));
+const nodeSection = emitNodes();
+chunks.forEach((edges, idx) => {
+  const outPath = path.join(OUT_DIR, `${BASENAME}_${idx + 1}.mmd`);
+  const lines = [header(), nodeSection];
+  for (const e of edges) {
+    const [from, to] = e.split('-->');
+    lines.push(`  ${sanitizeId(from)} --> ${sanitizeId(to)}`);
+  }
+  writeText(outPath, lines.join('\n') + '\n');
+  // eslint-disable-next-line no-console
+  console.log(`Wrote ${outPath} (edges: ${edges.length})`);
+});
+
+// also write a tiny index file that links the parts
+const indexLines = ['# Navigation Graph (split)', ''];
+chunks.forEach((_, idx) => {
+  indexLines.push(`- \`${BASENAME}_${idx + 1}.mmd\``);
+});
+writeText(path.join(OUT_DIR, `${BASENAME}_INDEX.md`), indexLines.join('\n') + '\n');
