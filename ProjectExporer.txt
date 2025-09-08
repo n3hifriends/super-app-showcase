@@ -1,3 +1,11 @@
+limit increase ----
+{
+  "maxEdges": 5000,
+  "flowchart": { "nodeSpacing": 70, "rankSpacing": 100, "curve": "basis" },
+  "themeVariables": { "fontSize": "18px", "lineHeight": "24px" }
+}
+-----
+
 #!/usr/bin/env node
 /**
  * React Navigation → Mermaid generator (split-safe)
